@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>形態素解析ツール</title>
+<script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5/papaparse.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:'Hiragino Sans','Yu Gothic','Meiryo',sans-serif;background:#f1f5f9;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useMemo, useEffect, useCallback } = React;
+const CDN = "https://cdn.jsdelivr.net/npm/kuromoji@0.1.2";
+
+function patchXHR() {
+  const Orig = window.XMLHttpRequest;
+  window.XMLHttpRequest = class MockXHR {
+    constructor() { this.readyState=0;this.status=0;this.response=null;this.responseType="";this.onload=null;this.onerror=null;this._url=""; }
+    open(_,url){ this._url=url; }
+    setRequestHeader(){}
+    send(){
+      const url=this._url.startsWith("http")?this._url:`${CDN}/dict/${this._url.split("/").pop()}`;
+      fetch(url).then(r=>{if(!r.ok)throw new Error(`HTTP ${r.status}`);return r.arrayBuffer();})
+        .then(buf=>{this.status=200;this.readyState=4;this.response=buf;this.onload?.({target:this});})
+        .catch(e=>{this.status=0;this.readyState=4;this.onerror?.(e);});
+    }
+    abort(){}
+    addEventListener(t,fn){if(t==="load")this.onload=fn;if(t==="error")this.onerror=fn;}
+    removeEventListener(){}
+    getAllResponseHeaders(){return "";}
+    getResponseHeader(){return null;}
+  };
+  return Orig;
+}
+
+async function loadKuromoji(onProgress) {
+  if (window.__kuromojiTokenizer) return window.__kuromojiTokenizer;
+  onProgress("kuromoji.js を読み込み中...", 10);
+  if (!window.kuromoji) {
+    const r = await fetch(`${CDN}/build/kuromoji.js`);
+    if (!r.ok) throw new Error("kuromoji.js 取得失敗: HTTP "+r.status);
+    const s = document.createElement("script");
+    s.textContent = await r.text();
+    document.head.appendChild(s);
+    if (!window.kuromoji) throw new Error("kuromoji.js の読み込みに失敗");
+  }
+  onProgress("辞書を構築中...", 40);
+  const origXHR = patchXHR();
+  try {
+    const tok = await new Promise((res,rej) => {
+      window.kuromoji.builder({dicPath:"./"}).build((err,t) => err?rej(new Error(String(err))):res(t));
+    });
+    window.__kuromojiTokenizer = tok;
+    return tok;
+  } finally { window.XMLHttpRequest = origXHR; }
+}
+
+const STOP_POS   = new Set(["助詞","助動詞","記号","接続詞","感動詞","接頭詞"]);
+const STOP_WORDS = new Set(["する","ある","いる","なる","れる","られる","ます","です","ない","たい","ため","こと","もの","これ","それ","あれ","ここ","そこ","など","的","各","全","毎","は","が","を","に","で","と","も","の","や","か","な","へ","ね","よ","し","て","から","まで","より","ので","という","として","について","において","による","にて","でも","けど","なの"]);
+const GEO_SUFFIX = new Set(["市","県","区","町","村","都","道","府"]);
+
+function geoMerge(tokens) {
+  const out=[];
+  for(let i=0;i<tokens.length;i++){
+    if(i+1<tokens.length&&GEO_SUFFIX.has(tokens[i+1])){out.push(tokens[i]+tokens[i+1]);i++;}
+    else if(GEO_SUFFIX.has(tokens[i])&&out.length>0)out[out.length-1]+=tokens[i];
+    else out.push(tokens[i]);
+  }
+  return out;
+}
+
+function tokenize(tok,query,phrases){
+  if(!tok||!query)return[];
+  const q=query.replace(/[\s　]/g,"");
+  if(!q)return[];
+  const sorted=[...phrases].filter(p=>p).sort((a,b)=>b.length-a.length);
+  let segs=[{protected:false,text:q}];
+  for(const phrase of sorted){
+    const next=[];
+    for(const seg of segs){
+      if(seg.protected){next.push(seg);continue;}
+      const parts=seg.text.split(phrase);
+      if(parts.length===1){next.push(seg);continue;}
+      for(let i=0;i<parts.length;i++){
+        if(parts[i])next.push({protected:false,text:parts[i]});
+        if(i<parts.length-1)next.push({protected:true,text:phrase});
+      }
+    }
+    segs=next;
+  }
+  const result=[];
+  for(const seg of segs){
+    if(seg.protected){if(seg.text.length>=2)result.push(seg.text);continue;}
+    if(!seg.text)continue;
+    try{
+      for(const t of tok.tokenize(seg.text)){
+        const s=t.surface_form;
+        if(!s||s.length===1)continue;
+        if(STOP_POS.has(t.pos)||STOP_WORDS.has(s))continue;
+        if(/^[a-zA-Z0-9ａ-ｚＡ-Ｚ０-９]+$/.test(s))continue;
+        const useBase=(t.pos==="動詞"||t.pos==="形容詞")&&t.basic_form&&t.basic_form!=="*";
+        result.push(useBase?t.basic_form:s);
+      }
+    }catch(_){}
+  }
+  return geoMerge(result);
+}
+
+function getEffectiveParams(params,results){
+  const withCV=results.filter(r=>r.conversions>0&&r.cpa!=null);
+  const avgCPA=withCV.length>0?Math.round(withCV.reduce((s,r)=>s+r.cpa,0)/withCV.length):0;
+  const avgClicks=results.length>0?Math.round(results.reduce((s,r)=>s+r.clicks,0)/results.length):10;
+  return{
+    targetCPA:params.targetCPA?Number(params.targetCPA):avgCPA,
+    minClicks:params.minClicks?Number(params.minClicks):Math.max(avgClicks,5),
+    minCVTolerance:params.minCVTolerance?Number(params.minCVTolerance):3,
+    cpaMultiplier:params.cpaMultiplier?Number(params.cpaMultiplier):2,
+    usingAvg:{targetCPA:!params.targetCPA,minClicks:!params.minClicks},
+    avgCPA,
+  };
+}
+
+function classify(row,ep){
+  const{targetCPA,minClicks,minCVTolerance,cpaMultiplier}=ep;
+  if(targetCPA===0)return"neutral";
+  if(row.conversions===0&&row.clicks>=minClicks)return"red";
+  if(row.cpa!=null&&row.cpa>targetCPA*cpaMultiplier&&row.conversions<minCVTolerance)return"red";
+  if(row.cpa!=null&&row.cpa>targetCPA&&row.conversions>=minCVTolerance)return"yellow";
+  if(row.conversions>0&&row.conversions<3&&row.cvr>5)return"yellow";
+  if(row.conversions>0&&row.cpa!=null&&row.cpa<=targetCPA)return"green";
+  return"neutral";
+}
+
+const STATUS_LABEL={green:"🟢 優良",yellow:"🟡 要観察",red:"🔴 除外候補",neutral:"　—"};
+const STATUS_BG={green:"#f0fdf4",yellow:"#fefce8",red:"#fef2f2",neutral:"transparent"};
+
+const AUTO_DETECT=[
+  {key:"query",pats:["検索語句","search term","query"]},
+  {key:"impressions",pats:["表示回数","impression","impr"]},
+  {key:"clicks",pats:["クリック数","clicks"]},
+  {key:"conversions",pats:["コンバージョン数","コンバージョン","conversions"]},
+  {key:"cost",pats:["費用","cost","spend"]},
+];
+const COL_LABELS={query:"検索語句",impressions:"表示回数",clicks:"クリック数",conversions:"コンバージョン数",cost:"費用（円）"};
+
+function autoDetect(hdrs){
+  const m={query:"",impressions:"",clicks:"",conversions:"",cost:""};
+  for(const{key,pats}of AUTO_DETECT){
+    for(const h of hdrs){
+      const lo=h.toLowerCase();
+      if(!pats.some(p=>lo.includes(p.toLowerCase())))continue;
+      if(key==="conversions"&&lo.match(/率|値|rate|value\/conv/i))continue;
+      if(key==="clicks"&&lo.match(/率|rate|ctr/i))continue;
+      m[key]=h;break;
+    }
+  }
+  return m;
+}
+
+function parseNum(v){
+  if(!v&&v!==0)return 0;
+  return parseFloat(String(v).replace(/[,，￥¥\s]/g,"").replace(/[^0-9.-]/g,""))||0;
+}
+function fmt(v,dec=0){
+  if(v==null||isNaN(v))return"—";
+  return v.toLocaleString("ja-JP",{minimumFractionDigits:dec,maximumFractionDigits:dec});
+}
+function numOnly(v,dec=0){
+  if(v==null||isNaN(v))return"";
+  return Number(v.toFixed(dec));
+}
+
+const BASE={minHeight:"100vh",background:"#f1f5f9",padding:"1.5rem"};
+const WRAP={maxWidth:740,margin:"0 auto"};
+const CARD={background:"#fff",borderRadius:14,padding:"1.5rem",boxShadow:"0 1px 10px rgba(0,0,0,0.07)",marginBottom:"1rem"};
+const TH={padding:"10px 14px",fontSize:11,fontWeight:700,color:"#64748b",cursor:"pointer",whiteSpace:"nowrap",userSelect:"none",background:"#f8fafc",borderBottom:"2px solid #e2e8f0"};
+const TD=i=>({padding:"9px 14px",fontSize:13,borderBottom:"1px solid #f1f5f9",background:i%2===0?"#fff":"#fafafa",whiteSpace:"nowrap"});
+const btn=(p,sm,danger)=>({background:danger?"#fee2e2":p?"#2563eb":"#f1f5f9",color:danger?"#dc2626":p?"#fff":"#475569",border:"none",borderRadius:8,cursor:"pointer",fontWeight:600,padding:sm?"5px 12px":"8px 20px",fontSize:sm?12:14});
+const inp={padding:"7px 10px",borderRadius:8,border:"1px solid #e2e8f0",fontSize:13,width:"100%",boxSizing:"border-box"};
+
+const COLS=[
+  {key:"status",label:"判定",align:"left"},
+  {key:"morpheme",label:"形態素",align:"left"},
+  {key:"queryCount",label:"クエリ数",align:"right"},
+  {key:"impressions",label:"表示回数",align:"right"},
+  {key:"clicks",label:"クリック",align:"right"},
+  {key:"ctr",label:"CTR",align:"right"},
+  {key:"conversions",label:"CV数",align:"right"},
+  {key:"cvr",label:"CVR",align:"right"},
+  {key:"cpa",label:"CPA",align:"right"},
+  {key:"cost",label:"費用",align:"right"},
+];
+
+function renderCell(col,row){
+  switch(col.key){
+    case"status":return STATUS_LABEL[row.status]||"—";
+    case"morpheme":return row.morpheme;
+    case"queryCount":return fmt(row.queryCount);
+    case"impressions":return fmt(row.impressions);
+    case"clicks":return fmt(row.clicks);
+    case"ctr":return fmt(row.ctr,2)+"%";
+    case"conversions":return fmt(row.conversions,1);
+    case"cvr":return fmt(row.cvr,2)+"%";
+    case"cpa":return row.cpa!=null?"¥"+fmt(row.cpa):"—";
+    case"cost":return"¥"+fmt(row.cost);
+    default:return"";
+  }
+}
+
+function App(){
+  const[step,setStep]=useState("upload");
+  const[ksState,setKsState]=useState({status:"idle",msg:"",pct:0,err:""});
+  const tokRef=useRef(null);
+  const[csvData,setCsvData]=useState([]);
+  const[headers,setHeaders]=useState([]);
+  const[colMap,setColMap]=useState({query:"",impressions:"",clicks:"",conversions:"",cost:""});
+  const[phraseText,setPhraseText]=useState("");
+  const[expand,setExpand]=useState(false);
+  const[showPanel,setShowPanel]=useState(false);
+  const[params,setParams]=useState({targetCPA:"",minClicks:"",minCVTolerance:"",cpaMultiplier:"2"});
+  const setParam=(k,v)=>setParams(p=>({...p,[k]:v}));
+  const aggRef=useRef({});
+  const[results,setResults]=useState([]);
+  const[progress,setProgress]=useState(0);
+  const[sortKey,setSortKey]=useState("conversions");
+  const[sortDir,setSortDir]=useState("desc");
+  const[minQ,setMinQ]=useState(1);
+  const[filter,setFilter]=useState("");
+  const[statusFilter,setStatusFilter]=useState("all");
+  const[error,setError]=useState("");
+  const[dragOver,setDragOver]=useState(false);
+  const fileRef=useRef();
+
+  useEffect(()=>{
+    setKsState({status:"loading",msg:"",pct:0,err:""});
+    loadKuromoji((msg,pct)=>setKsState(s=>({...s,msg,pct})))
+      .then(t=>{tokRef.current=t;setKsState({status:"ready",msg:"",pct:100,err:""});})
+      .catch(e=>setKsState({status:"error",msg:"",pct:0,err:e.message}));
+  },[]);
+
+  const retryKuromoji=()=>{
+    window.__kuromojiTokenizer=null;
+    setKsState({status:"loading",msg:"",pct:0,err:""});
+    loadKuromoji((msg,pct)=>setKsState(s=>({...s,msg,pct})))
+      .then(t=>{tokRef.current=t;setKsState({status:"ready",msg:"",pct:100,err:""});})
+      .catch(e=>setKsState({status:"error",msg:"",pct:0,err:e.message}));
+  };
+
+  const phrases=useMemo(()=>phraseText.split("\n").map(s=>s.trim()).filter(Boolean),[phraseText]);
+  const ep=useMemo(()=>getEffectiveParams(params,results),[params,results]);
+
+  const handleFile=(file)=>{
+    if(!file)return;setError("");
+    Papa.parse(file,{
+      header:true,skipEmptyLines:true,
+      complete:res=>{
+        const data=res.data.filter(row=>!String(Object.values(row)[0]||"").match(/^(合計|小計|Total|Grand Total|--)/i));
+        if(!data.length){setError("データが見つかりません。");return;}
+        const hdrs=Object.keys(data[0]);
+        setCsvData(data);setHeaders(hdrs);setColMap(autoDetect(hdrs));setStep("mapping");
+      },
+      error:e=>setError("CSV解析エラー: "+e.message),
+    });
+  };
+  const onDrop=e=>{
+    e.preventDefault();setDragOver(false);
+    const f=e.dataTransfer.files[0];
+    if(f&&f.name.endsWith(".csv"))handleFile(f);else setError("CSVファイルを選択してください");
+  };
+
+  function runAnalysis(tok,agg,phraseList,doExpand){
+    const queries=Object.keys(agg);
+    const phraseComponents={};
+    if(doExpand){for(const p of phraseList)phraseComponents[p]=tokenize(tok,p,[]);}
+    const morphMap={};
+    const CHUNK=200;let idx=0;
+    function add(m,q,data){
+      if(!morphMap[m])morphMap[m]={morpheme:m,qs:{},imp:0,clicks:0,conv:0,cost:0};
+      morphMap[m].qs[q]=true;
+      morphMap[m].imp+=data.imp;morphMap[m].clicks+=data.clicks;
+      morphMap[m].conv+=data.conv;morphMap[m].cost+=data.cost;
+    }
+    function chunk(){
+      const end=Math.min(idx+CHUNK,queries.length);
+      for(let i=idx;i<end;i++){
+        const q=queries[i],data=agg[q];
+        const tokens=tokenize(tok,q,phraseList);
+        for(const m of tokens)add(m,q,data);
+        if(doExpand)for(const m of tokens){const c=phraseComponents[m];if(c)for(const x of c)add(x,q,data);}
+      }
+      idx=end;setProgress(Math.round(idx/queries.length*100));
+      if(idx<queries.length){setTimeout(chunk,0);return;}
+      setResults(Object.values(morphMap).map(({morpheme,qs,imp,clicks,conv,cost})=>({
+        morpheme,queryCount:Object.keys(qs).length,
+        impressions:Math.round(imp),clicks:Math.round(clicks),
+        conversions:Math.round(conv*10)/10,cost:Math.round(cost),
+        ctr:imp>0?clicks/imp*100:0,cvr:clicks>0?conv/clicks*100:0,cpa:conv>0?cost/conv:null,
+      })));
+      setStep("results");
+    }
+    setTimeout(chunk,0);
+  }
+
+  const startAnalysis=()=>{
+    if(!colMap.query){setError("検索語句のカラムを選択してください");return;}
+    if(!tokRef.current){setError("辞書の読み込みが完了していません");return;}
+    setError("");setProgress(0);setStep("analyzing");
+    const agg={};
+    for(const row of csvData){
+      const q=row[colMap.query];if(!q)continue;
+      if(!agg[q])agg[q]={imp:0,clicks:0,conv:0,cost:0};
+      agg[q].imp+=parseNum(row[colMap.impressions]);agg[q].clicks+=parseNum(row[colMap.clicks]);
+      agg[q].conv+=parseNum(row[colMap.conversions]);agg[q].cost+=parseNum(row[colMap.cost]);
+    }
+    if(!Object.keys(agg).length){setError("検索語句が見つかりません");setStep("mapping");return;}
+    aggRef.current=agg;
+    runAnalysis(tokRef.current,agg,phrases,expand);
+  };
+
+  const rerun=(newPhrases,newExpand)=>{
+    if(!tokRef.current||!Object.keys(aggRef.current).length)return;
+    setProgress(0);setStep("analyzing");
+    runAnalysis(tokRef.current,aggRef.current,newPhrases,newExpand);
+  };
+
+  const handleSort=key=>{if(sortKey===key)setSortDir(d=>d==="desc"?"asc":"desc");else{setSortKey(key);setSortDir("desc");}};
+
+  const withStatus=useMemo(()=>results.map(r=>({...r,status:classify(r,ep)})),[results,ep]);
+
+  const sorted=useMemo(()=>
+    withStatus
+      .filter(r=>r.queryCount>=minQ&&(!filter||r.morpheme.includes(filter))&&(statusFilter==="all"||r.status===statusFilter))
+      .sort((a,b)=>{const av=a[sortKey]??(sortDir==="desc"?-1e9:1e9),bv=b[sortKey]??(sortDir==="desc"?-1e9:1e9);return sortDir==="desc"?bv-av:av-bv;}),
+  [withStatus,sortKey,sortDir,minQ,filter,statusFilter]);
+
+  const downloadCSV=useCallback(()=>{
+    try{
+      const hdr=["判定","形態素","クエリ数","表示回数","クリック数","CTR(%)","CV数","CVR(%)","CPA(円)","費用(円)"];
+      const rows=sorted.map(r=>[
+        (STATUS_LABEL[r.status]||"").replace(/[🟢🟡🔴　]/g,"").trim(),
+        r.morpheme,r.queryCount,r.impressions,r.clicks,
+        numOnly(r.ctr,2),numOnly(r.conversions,1),numOnly(r.cvr,2),
+        r.cpa!=null?Math.round(r.cpa):"",r.cost,
+      ]);
+      const csv=[hdr,...rows].map(row=>row.map(c=>{const s=String(c??"");return s.includes(",")?`"${s}"`:s;}).join(",")).join("\n");
+      const blob=new Blob(["\uFEFF"+csv],{type:"text/csv;charset=utf-8;"});
+      const url=URL.createObjectURL(blob);
+      const a=document.createElement("a");
+      a.href=url;a.download="形態素解析レポート.csv";
+      document.body.appendChild(a);a.click();document.body.removeChild(a);
+      setTimeout(()=>URL.revokeObjectURL(url),1000);
+    }catch(e){alert("CSV出力エラー: "+e.message);}
+  },[sorted]);
+
+  const KsBadge=()=>{
+    const{status,msg,pct,err}=ksState;
+    if(status==="ready")return(<div style={{display:"flex",alignItems:"center",gap:8,padding:"8px 12px",background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:10,fontSize:12}}><span>✅</span><span style={{color:"#166534",fontWeight:600}}>kuromoji.js 辞書 読み込み完了</span></div>);
+    if(status==="loading")return(<div style={{padding:"10px 12px",background:"#fefce8",border:"1px solid #fde68a",borderRadius:10,fontSize:12}}><div style={{fontWeight:600,color:"#854d0e",marginBottom:6}}>⏳ {msg||"準備中..."}</div><div style={{background:"#fde68a",borderRadius:99,height:4,overflow:"hidden"}}><div style={{background:"#d97706",height:4,width:pct+"%",transition:"width 0.4s"}}/></div></div>);
+    if(status==="error")return(<div style={{padding:"10px 12px",background:"#fef2f2",border:"1px solid #fca5a5",borderRadius:10,fontSize:12}}><div style={{color:"#dc2626",fontWeight:600,marginBottom:4}}>⚠️ 読み込み失敗: {err}</div><button style={btn(false,true)} onClick={retryKuromoji}>再試行</button></div>);
+    return null;
+  };
+
+  const PhrasePanel=()=>(
+    <div style={{position:"fixed",top:0,right:0,bottom:0,width:300,background:"#fff",boxShadow:"-4px 0 24px rgba(0,0,0,0.12)",zIndex:900,display:"flex",flexDirection:"column"}}>
+      <div style={{padding:"1rem",borderBottom:"1px solid #e2e8f0",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div style={{fontWeight:800,fontSize:14}}>📖 フレーズルール</div>
+        <button style={btn(false,true)} onClick={()=>setShowPanel(false)}>✕</button>
+      </div>
+      <div style={{flex:1,padding:"0.8rem",display:"flex",flexDirection:"column",gap:8,overflow:"auto"}}>
+        <textarea value={phraseText}
+          onChange={e=>{const v=e.target.value;setPhraseText(v);rerun(v.split("\n").map(s=>s.trim()).filter(Boolean),expand);}}
+          placeholder={"通信制高校\n通信制"} style={{flex:1,minHeight:160,padding:"8px 10px",borderRadius:8,border:"1px solid #e2e8f0",fontSize:13,resize:"none",fontFamily:"inherit"}}/>
+        <label style={{display:"flex",alignItems:"flex-start",gap:8,cursor:"pointer",padding:"10px",background:"#f8fafc",borderRadius:8,border:"1px solid #e2e8f0"}}>
+          <input type="checkbox" checked={expand} style={{marginTop:2,flexShrink:0}} onChange={e=>{setExpand(e.target.checked);rerun(phrases,e.target.checked);}}/>
+          <div><div style={{fontSize:12,fontWeight:600}}>構成要素に重複カウント</div><div style={{fontSize:11,color:"#94a3b8",marginTop:1}}>「通信制高校」→「通信制」「高校」にも集計</div></div>
+        </label>
+        <div style={{fontSize:11,color:"#94a3b8"}}>{phrases.length}件登録</div>
+      </div>
+    </div>
+  );
+
+  if(step==="upload")return(
+    <div style={BASE}><div style={WRAP}>
+      <h1 style={{fontSize:22,fontWeight:800,color:"#1e293b",margin:"0 0 4px"}}>🔍 形態素解析ツール</h1>
+      <p style={{color:"#64748b",fontSize:13,marginBottom:"1.5rem"}}>Google広告 検索語句レポート / kuromoji.js 辞書解析</p>
+      <div style={CARD}>
+        <div onDragOver={e=>{e.preventDefault();setDragOver(true);}} onDragLeave={()=>setDragOver(false)} onDrop={onDrop} onClick={()=>fileRef.current.click()}
+          style={{border:`2px dashed ${dragOver?"#2563eb":"#cbd5e1"}`,borderRadius:12,padding:"2.5rem 1rem",textAlign:"center",cursor:"pointer",background:dragOver?"#eff6ff":"#f8fafc"}}>
+          <div style={{fontSize:36,marginBottom:8}}>📂</div>
+          <div style={{fontWeight:700,marginBottom:4}}>CSVをアップロード</div>
+          <div style={{fontSize:12,color:"#94a3b8"}}>Google広告 検索語句レポート（CSV形式）</div>
+          <input ref={fileRef} type="file" accept=".csv" onChange={e=>handleFile(e.target.files[0])} style={{display:"none"}}/>
+        </div>
+        {error&&<p style={{color:"#ef4444",fontSize:13,marginTop:10}}>⚠️ {error}</p>}
+      </div>
+      <KsBadge/>
+    </div></div>
+  );
+
+  if(step==="mapping"){
+    const uniq=new Set(csvData.map(r=>r[colMap.query]).filter(Boolean)).size;
+    return(
+      <div style={BASE}><div style={WRAP}>
+        <h1 style={{fontSize:20,fontWeight:800,marginBottom:"1rem"}}>カラム設定</h1>
+        <div style={{display:"flex",gap:12,marginBottom:"1rem",flexWrap:"wrap"}}>
+          {[["📄 総行数",csvData.length.toLocaleString()+"行"],["🔑 ユニーククエリ",uniq.toLocaleString()+"件"],["⚡ 推定時間","数秒"]].map(([l,v])=>(
+            <div key={l} style={{background:"#fff",borderRadius:10,padding:"8px 14px",boxShadow:"0 1px 6px rgba(0,0,0,0.06)",fontSize:12}}>
+              <div style={{color:"#94a3b8"}}>{l}</div><div style={{fontWeight:700,fontSize:15}}>{v}</div>
+            </div>
+          ))}
+        </div>
+        <div style={{marginBottom:"1rem"}}><KsBadge/></div>
+        <div style={CARD}>
+          <div style={{fontWeight:800,fontSize:14,marginBottom:12}}>カラムマッピング</div>
+          {Object.keys(colMap).map(key=>(
+            <div key={key} style={{marginBottom:12}}>
+              <label style={{fontSize:13,fontWeight:600,display:"block",marginBottom:4}}>
+                {COL_LABELS[key]}{key==="query"&&<span style={{color:"#ef4444"}}> *必須</span>}
+              </label>
+              <select value={colMap[key]} onChange={e=>{const v=e.target.value;setColMap(p=>({...p,[key]:v}));}} style={{...inp,background:"#fff"}}>
+                <option value="">— 選択してください —</option>
+                {headers.map(h=><option key={h} value={h}>{h}</option>)}
+              </select>
+            </div>
+          ))}
+          {error&&<p style={{color:"#ef4444",fontSize:13}}>⚠️ {error}</p>}
+          <div style={{display:"flex",gap:10,marginTop:16}}>
+            <button style={btn(false)} onClick={()=>setStep("upload")}>← 戻る</button>
+            <button style={btn(true)} onClick={startAnalysis}>🚀 分析開始</button>
+          </div>
+        </div>
+        <div style={CARD}>
+          <div style={{fontWeight:800,fontSize:14,marginBottom:4}}>⚙️ 判定パラメータ</div>
+          <div style={{fontSize:11,color:"#94a3b8",marginBottom:12}}>未入力の場合はレポートの平均値から自動算出します</div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+            {[
+              {key:"targetCPA",label:"目標CPA（円）",placeholder:"未入力→平均CPA"},
+              {key:"minClicks",label:"CV0除外クリック閾値",placeholder:"未入力→平均クリック数"},
+              {key:"minCVTolerance",label:"高CPA許容の最低CV数",placeholder:"未入力→3"},
+              {key:"cpaMultiplier",label:"除外判定のCPA倍率",placeholder:"未入力→2"},
+            ].map(({key,label,placeholder})=>(
+              <div key={key}>
+                <label style={{fontSize:12,fontWeight:600,display:"block",marginBottom:4}}>{label}</label>
+                <input type="number" value={params[key]} onChange={e=>setParam(key,e.target.value)} placeholder={placeholder} style={inp}/>
+              </div>
+            ))}
+          </div>
+          <div style={{marginTop:12,padding:"10px 12px",background:"#eff6ff",borderRadius:8,fontSize:11,color:"#1e40af"}}>
+            🟢 優良：CPA目標以内でCV有り　🟡 要観察：CPAが目標超えだがCV{params.minCVTolerance||"3"}件以上　🔴 除外候補：CV0でクリック{params.minClicks||"平均"}以上 or CPA目標の{params.cpaMultiplier||"2"}倍超でCV少
+          </div>
+        </div>
+        <div style={CARD}>
+          <div style={{fontWeight:800,fontSize:14,marginBottom:4}}>📖 フレーズルール <span style={{fontSize:12,color:"#94a3b8",fontWeight:400}}>（任意）</span></div>
+          <div style={{fontSize:11,color:"#94a3b8",marginBottom:10}}>1行1フレーズ。分割させたくない語句を事前登録。市・県・区などは自動結合されます。</div>
+          <textarea value={phraseText} onChange={e=>setPhraseText(e.target.value)} placeholder={"通信制高校\n通信制\n高等学校"} rows={5}
+            style={{width:"100%",padding:"8px 10px",borderRadius:8,border:"1px solid #e2e8f0",fontSize:13,resize:"vertical",boxSizing:"border-box",fontFamily:"inherit"}}/>
+          <label style={{display:"flex",alignItems:"flex-start",gap:8,cursor:"pointer",marginTop:10,padding:"10px",background:"#f8fafc",borderRadius:8,border:"1px solid #e2e8f0"}}>
+            <input type="checkbox" checked={expand} onChange={e=>setExpand(e.target.checked)} style={{marginTop:2,flexShrink:0}}/>
+            <div>
+              <div style={{fontSize:13,fontWeight:600}}>フレーズの構成要素にも重複カウントする</div>
+              <div style={{fontSize:11,color:"#94a3b8",marginTop:2}}>OFF：「通信制高校」クエリは「通信制高校」のみ集計　ON：「通信制」「高校」にも重複集計</div>
+            </div>
+          </label>
+          <div style={{fontSize:11,color:"#94a3b8",marginTop:6}}>{phrases.length}件登録</div>
+        </div>
+      </div></div>
+    );
+  }
+
+  if(step==="analyzing")return(
+    <div style={{...BASE,display:"flex",alignItems:"center",justifyContent:"center"}}>
+      <div style={{textAlign:"center",maxWidth:400}}>
+        <div style={{fontSize:52,marginBottom:12}}>⚙️</div>
+        <h2 style={{fontSize:20,fontWeight:800,marginBottom:16}}>形態素解析中...</h2>
+        <div style={{background:"#e2e8f0",borderRadius:99,height:12,overflow:"hidden",marginBottom:8}}>
+          <div style={{background:"linear-gradient(90deg,#2563eb,#06b6d4)",height:12,width:progress+"%",borderRadius:99,transition:"width 0.3s ease"}}/>
+        </div>
+        <p style={{fontSize:16,color:"#2563eb",fontWeight:800}}>{progress}%</p>
+        <p style={{fontSize:12,color:"#94a3b8",marginTop:8}}>kuromoji.js でローカル処理中</p>
+      </div>
+    </div>
+  );
+
+  const topCV=[...withStatus].filter(r=>r.conversions>0).sort((a,b)=>b.conversions-a.conversions).slice(0,10);
+  const topRed=[...withStatus].map(r=>({...r,deficit:r.cost-(r.conversions*ep.targetCPA)})).filter(r=>r.deficit>0).sort((a,b)=>b.deficit-a.deficit).slice(0,10);
+  const uCount=new Set(csvData.map(r=>r[colMap.query]).filter(Boolean)).size;
+  const redCount=withStatus.filter(r=>r.status==="red").length;
+  const greenCount=withStatus.filter(r=>r.status==="green").length;
+  const yellowCount=withStatus.filter(r=>r.status==="yellow").length;
+
+  return(
+    <div style={{...BASE,padding:"1rem 1.5rem"}}>
+      {showPanel&&<PhrasePanel/>}
+      <div style={{maxWidth:1140,margin:"0 auto"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:14,flexWrap:"wrap",gap:8}}>
+          <div>
+            <h1 style={{fontSize:19,fontWeight:800,margin:0}}>形態素別パフォーマンスレポート</h1>
+            <p style={{color:"#64748b",fontSize:12,marginTop:3}}>{results.length}個の形態素 / {uCount.toLocaleString()}ユニーククエリ / {csvData.length.toLocaleString()}行</p>
+          </div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            <button style={{...btn(false,true),position:"relative"}} onClick={()=>setShowPanel(v=>!v)}>
+              📖 フレーズルール
+              {phrases.length>0&&<span style={{position:"absolute",top:-6,right:-6,background:"#2563eb",color:"#fff",borderRadius:99,fontSize:10,padding:"1px 5px",fontWeight:700}}>{phrases.length}</span>}
+            </button>
+            <button style={btn(false,true)} onClick={downloadCSV}>⬇ CSV</button>
+            <button style={btn(false,true)} onClick={()=>{setStep("upload");setResults([]);aggRef.current={};}}>やり直す</button>
+          </div>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:14}}>
+          {[
+            ["🟢 優良",greenCount,"#f0fdf4","#16a34a","green"],
+            ["🟡 要観察",yellowCount,"#fefce8","#ca8a04","yellow"],
+            ["🔴 除外候補",redCount,"#fef2f2","#dc2626","red"],
+            ["　目標CPA",ep.usingAvg.targetCPA?"¥"+fmt(ep.targetCPA)+"\n(平均値)":"¥"+fmt(ep.targetCPA),"#f8fafc","#475569","_"],
+          ].map(([l,v,bg,color,sf])=>(
+            <div key={l} onClick={()=>sf!=="all"&&sf!=="_"&&setStatusFilter(statusFilter===sf?"all":sf)}
+              style={{background:statusFilter===sf&&sf!=="all"&&sf!=="_"?bg:"#fff",borderRadius:12,padding:"10px 14px",boxShadow:"0 1px 8px rgba(0,0,0,0.07)",cursor:sf!=="all"&&sf!=="_"?"pointer":"default",border:`1px solid ${statusFilter===sf&&sf!=="all"&&sf!=="_"?color+"44":"#e2e8f0"}`,transition:"all 0.15s"}}>
+              <div style={{fontSize:11,color:"#94a3b8"}}>{l}</div>
+              <div style={{fontWeight:800,fontSize:18,color}}>{typeof v==="number"?v.toLocaleString():v}</div>
+            </div>
+          ))}
+        </div>
+
+        {topCV.length>0&&(
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+            <div style={{...CARD,padding:"1rem",margin:0}}>
+              <div style={{fontSize:11,fontWeight:700,color:"#64748b",marginBottom:8}}>🏆 CV数 TOP10</div>
+              {topCV.map(r=>(
+                <div key={r.morpheme} style={{display:"flex",justifyContent:"space-between",fontSize:12,padding:"4px 0",borderBottom:"1px solid #f1f5f9",gap:8}}>
+                  <span style={{fontWeight:600,flexShrink:0}}>{r.morpheme}</span>
+                  <span style={{color:"#64748b",fontSize:11,textAlign:"right"}}>CV {fmt(r.conversions,1)}　CPA {r.cpa!=null?"¥"+fmt(r.cpa):"—"}</span>
+                </div>
+              ))}
+            </div>
+            <div style={{...CARD,padding:"1rem",margin:0}}>
+              <div style={{fontSize:11,fontWeight:700,color:"#64748b",marginBottom:4}}>🔴 除外候補 TOP10（赤字見込み大）</div>
+              <div style={{fontSize:10,color:"#94a3b8",marginBottom:8}}>赤字見込み = 費用 − CV数 × 目標CPA（¥{fmt(ep.targetCPA)}）</div>
+              {topRed.map(r=>(
+                <div key={r.morpheme} style={{display:"flex",justifyContent:"space-between",fontSize:12,padding:"4px 0",borderBottom:"1px solid #f1f5f9",gap:8}}>
+                  <span style={{fontWeight:600,flexShrink:0}}>{r.morpheme}</span>
+                  <span style={{color:"#dc2626",fontSize:11,textAlign:"right"}}>赤字 ¥{fmt(r.deficit)}　費用 ¥{fmt(r.cost)}　CV {fmt(r.conversions,1)}</span>
+                </div>
+              ))}
+              {topRed.length===0&&<div style={{fontSize:12,color:"#94a3b8",textAlign:"center",padding:"1rem 0"}}>除外候補なし</div>}
+            </div>
+          </div>
+        )}
+
+        <div style={{...CARD,padding:"0.75rem 1rem",display:"flex",gap:12,alignItems:"center",flexWrap:"wrap",marginBottom:10}}>
+          <label style={{fontSize:12,color:"#64748b",display:"flex",alignItems:"center",gap:6}}>
+            形態素を検索:
+            <input value={filter} onChange={e=>setFilter(e.target.value)} placeholder="絞り込み..." style={{padding:"5px 10px",borderRadius:7,border:"1px solid #e2e8f0",fontSize:13,width:130}}/>
+          </label>
+          <label style={{fontSize:12,color:"#64748b",display:"flex",alignItems:"center",gap:6}}>
+            最小クエリ数:
+            <input type="number" value={minQ} min={1} onChange={e=>setMinQ(Number(e.target.value)||1)} style={{width:55,padding:"5px 8px",borderRadius:7,border:"1px solid #e2e8f0",fontSize:13}}/>
+          </label>
+          <span style={{fontSize:12,color:"#94a3b8",marginLeft:"auto"}}>表示: {sorted.length}件</span>
+        </div>
+
+        <div style={{background:"#fff",borderRadius:12,boxShadow:"0 1px 10px rgba(0,0,0,0.07)",overflow:"hidden"}}>
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",minWidth:900}}>
+              <thead>
+                <tr>{COLS.map(col=>(
+                  <th key={col.key} style={{...TH,textAlign:col.align}} onClick={()=>!["status","morpheme"].includes(col.key)&&handleSort(col.key)}>
+                    {col.label}
+                    {!["status","morpheme"].includes(col.key)&&(sortKey===col.key
+                      ?<span style={{marginLeft:3,color:"#2563eb"}}>{sortDir==="desc"?"↓":"↑"}</span>
+                      :<span style={{color:"#cbd5e1",marginLeft:3}}>↕</span>)}
+                  </th>
+                ))}</tr>
+              </thead>
+              <tbody>
+                {sorted.length===0
+                  ?<tr><td colSpan={COLS.length} style={{padding:"2rem",textAlign:"center",color:"#94a3b8",fontSize:13}}>データがありません</td></tr>
+                  :sorted.map((row,i)=>(
+                    <tr key={row.morpheme} style={{background:STATUS_BG[row.status]}}>
+                      {COLS.map(col=>(
+                        <td key={col.key} style={{...TD(i),background:"transparent",textAlign:col.align,fontWeight:col.key==="morpheme"?600:400}}>
+                          {renderCell(col,row)}
+                        </td>
+                      ))}
+                    </tr>
+                  ))
+                }
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
